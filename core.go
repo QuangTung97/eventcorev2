@@ -79,11 +79,24 @@ type processConfig struct {
 }
 
 type processState struct {
-	queue *eventQueue
+	lastSequence Sequence
+}
+
+type fetchRequest struct {
+	fromSequence Sequence
+	data         []Event
+	limit        Sequence
+	responseChan chan<- fetchResponse
+}
+
+type fetchResponse struct {
+	existed bool
+	data    []Event
 }
 
 type fetchHandlerInput struct {
-	eventChan <-chan Event
+	eventChan   <-chan Event
+	requestChan <-chan fetchRequest
 }
 
 type fetchHandlerConfig struct {
@@ -94,20 +107,20 @@ type fetchHandlerState struct {
 	firstSequence Sequence
 	lastSequence  Sequence
 	data          []Event
+	waitList      []fetchRequest
 }
 
 //===========================================
 // Processor
 //===========================================
 
-func newProcessState(lastEvents []Event, cap int) *processState {
-	q := newEventQueue(cap)
-	for _, e := range lastEvents {
-		q.push(e)
+func newProcessState(lastEvents []Event, config *processConfig) *processState {
+	sequence := Sequence(0)
+	if len(lastEvents) > 0 {
+		sequence = config.getSequence(lastEvents[len(lastEvents)-1])
 	}
-
 	return &processState{
-		queue: q,
+		lastSequence: sequence,
 	}
 }
 
@@ -128,10 +141,7 @@ func processDBEvents(ctx context.Context, input processInput, state *processStat
 			return err
 		}
 
-		lastSequence := Sequence(0)
-		if state.queue.len > 0 {
-			lastSequence = config.getSequence(state.queue.back())
-		}
+		lastSequence := state.lastSequence
 
 		for i := range events {
 			lastSequence++
@@ -143,9 +153,7 @@ func processDBEvents(ctx context.Context, input processInput, state *processStat
 			return err
 		}
 
-		for _, e := range events {
-			state.queue.push(e)
-		}
+		state.lastSequence = lastSequence
 
 		for _, e := range events {
 			input.outputChan <- e
@@ -179,16 +187,76 @@ func (s *fetchHandlerState) appendEvent(event Event, config *fetchHandlerConfig)
 	if s.firstSequence == 0 {
 		s.firstSequence = seq
 	}
-	if seq >= s.firstSequence+n-1 {
+	if seq >= s.firstSequence+n {
 		s.firstSequence = seq + 1 - n
 	}
 	s.lastSequence = seq
 }
 
-func runFetchHandler(ctx context.Context, input fetchHandlerInput, state *fetchHandlerState, config *fetchHandlerConfig) {
+func copyStateData(stateData []Event, fromSequence Sequence,
+	lastSequence Sequence, limit Sequence, data []Event,
+) []Event {
+	end := lastSequence
+	if end >= fromSequence+limit {
+		end = fromSequence + limit - 1
+	}
+	for seq := fromSequence; seq <= end; seq++ {
+		index := seq % Sequence(len(stateData))
+		data = append(data, stateData[index])
+	}
+	return data
+}
+
+func returnFetchResponse(request fetchRequest, state *fetchHandlerState) {
+	if request.fromSequence < state.firstSequence {
+		request.responseChan <- fetchResponse{
+			existed: false,
+		}
+		return
+	}
+	request.responseChan <- fetchResponse{
+		existed: true,
+		data:    copyStateData(state.data, request.fromSequence, state.lastSequence, request.limit, request.data),
+	}
+}
+
+func clearWaitList(waitList []fetchRequest) []fetchRequest {
+	for i := range waitList {
+		waitList[i] = fetchRequest{}
+	}
+	return waitList[:0]
+}
+
+func runFetchHandler(ctx context.Context, input fetchHandlerInput,
+	state *fetchHandlerState, config *fetchHandlerConfig,
+) {
 	select {
 	case event := <-input.eventChan:
 		state.appendEvent(event, config)
+	BatchLoop:
+		for {
+			select {
+			case e := <-input.eventChan:
+				state.appendEvent(e, config)
+			default:
+				break BatchLoop
+			}
+		}
+		for _, req := range state.waitList {
+			returnFetchResponse(req, state)
+		}
+		state.waitList = clearWaitList(state.waitList)
+		return
+
+	case request := <-input.requestChan:
+		if request.fromSequence > state.lastSequence+1 {
+			panic("fromSequence MUST <= lastSequence + 1")
+		}
+		if state.firstSequence+1 == request.fromSequence {
+			state.waitList = append(state.waitList, request)
+			return
+		}
+		returnFetchResponse(request, state)
 		return
 
 	case <-ctx.Done():

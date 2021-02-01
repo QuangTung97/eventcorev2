@@ -8,7 +8,7 @@ import (
 )
 
 // x Processor
-// . FetchService
+// x FetchService
 // - Publisher
 // - AsyncPublisher??
 // x EventQueue
@@ -78,15 +78,14 @@ func TestProcessDBEvents_Signal(t *testing.T) {
 		updateCalled       int
 		updateCalledEvents []Event
 		outputEvents       []Event
-		queueEvents        []Event
+		lastSequence       Sequence
 	}{
 		{
 			name:     "get-unprocessed-error",
 			getError: errors.New("get error"),
 
-			getCalled:   1,
-			expected:    errors.New("get error"),
-			queueEvents: []Event{},
+			getCalled: 1,
+			expected:  errors.New("get error"),
 		},
 		{
 			name: "update-error-without-last-events",
@@ -104,8 +103,7 @@ func TestProcessDBEvents_Signal(t *testing.T) {
 				testEvent{id: 11, seq: 2},
 				testEvent{id: 15, seq: 3},
 			},
-			expected:    errors.New("update error"),
-			queueEvents: []Event{},
+			expected: errors.New("update error"),
 		},
 		{
 			name: "update-error-with-last-events",
@@ -127,11 +125,8 @@ func TestProcessDBEvents_Signal(t *testing.T) {
 				testEvent{id: 11, seq: 8},
 				testEvent{id: 15, seq: 9},
 			},
-			expected: errors.New("update error"),
-			queueEvents: []Event{
-				testEvent{id: 1, seq: 5},
-				testEvent{id: 3, seq: 6},
-			},
+			expected:     errors.New("update error"),
+			lastSequence: 6,
 		},
 		{
 			name: "update-ok-with-last-events",
@@ -157,12 +152,29 @@ func TestProcessDBEvents_Signal(t *testing.T) {
 				testEvent{id: 11, seq: 8},
 				testEvent{id: 15, seq: 9},
 			},
-			queueEvents: []Event{
-				testEvent{id: 3, seq: 6},
-				testEvent{id: 12, seq: 7},
-				testEvent{id: 11, seq: 8},
-				testEvent{id: 15, seq: 9},
+			lastSequence: 9,
+		},
+		{
+			name: "update-ok-without-last-events",
+			getEvents: []Event{
+				testEvent{id: 12},
+				testEvent{id: 11},
+				testEvent{id: 15},
 			},
+
+			getCalled:    1,
+			updateCalled: 1,
+			updateCalledEvents: []Event{
+				testEvent{id: 12, seq: 1},
+				testEvent{id: 11, seq: 2},
+				testEvent{id: 15, seq: 3},
+			},
+			outputEvents: []Event{
+				testEvent{id: 12, seq: 1},
+				testEvent{id: 11, seq: 2},
+				testEvent{id: 15, seq: 3},
+			},
+			lastSequence: 3,
 		},
 		{
 			name:        "multiple-signals",
@@ -189,12 +201,7 @@ func TestProcessDBEvents_Signal(t *testing.T) {
 				testEvent{id: 11, seq: 8},
 				testEvent{id: 15, seq: 9},
 			},
-			queueEvents: []Event{
-				testEvent{id: 3, seq: 6},
-				testEvent{id: 12, seq: 7},
-				testEvent{id: 11, seq: 8},
-				testEvent{id: 15, seq: 9},
-			},
+			lastSequence: 9,
 		},
 	}
 
@@ -236,7 +243,7 @@ func TestProcessDBEvents_Signal(t *testing.T) {
 				updateEvents:         updateEvents,
 			}
 
-			state := newProcessState(e.lastEvents, 4)
+			state := newProcessState(e.lastEvents, conf)
 
 			err := processDBEvents(ctx, processInput{
 				signalChan: signalChan,
@@ -251,21 +258,25 @@ func TestProcessDBEvents_Signal(t *testing.T) {
 			assert.Equal(t, e.updateCalled, updateCalled)
 			assert.Equal(t, e.updateCalledEvents, updateCalledEvents)
 			assert.Equal(t, e.outputEvents, outputEvents)
-			assert.Equal(t, e.queueEvents, state.queue.getAll())
+			assert.Equal(t, e.lastSequence, state.lastSequence)
 		})
 	}
 }
 
 func TestNewProcessState(t *testing.T) {
+	config := &processConfig{
+		getSequence: getSequence,
+	}
+
 	p := newProcessState([]Event{
 		testEvent{id: 1, seq: 5},
 		testEvent{id: 3, seq: 6},
-	}, 3)
+	}, config)
 
-	assert.Equal(t, []Event{
-		testEvent{id: 1, seq: 5},
-		testEvent{id: 3, seq: 6},
-	}, p.queue.getAll())
+	assert.Equal(t, Sequence(6), p.lastSequence)
+
+	p = newProcessState(nil, config)
+	assert.Equal(t, Sequence(0), p.lastSequence)
 }
 
 func TestRunFetchHandler_Context(t *testing.T) {
@@ -292,13 +303,16 @@ func TestRunFetchHandler_Context(t *testing.T) {
 func TestRunFetchHandler_Event(t *testing.T) {
 	table := []struct {
 		name        string
-		event       Event
+		events      []Event
 		stateBefore fetchHandlerState
 		stateAfter  fetchHandlerState
+		responses   []fetchResponse
 	}{
 		{
-			name:  "first",
-			event: testEvent{id: 10, seq: 2},
+			name: "first",
+			events: []Event{
+				testEvent{id: 10, seq: 2},
+			},
 			stateBefore: fetchHandlerState{
 				data: make([]Event, 4),
 			},
@@ -314,8 +328,10 @@ func TestRunFetchHandler_Event(t *testing.T) {
 			},
 		},
 		{
-			name:  "second",
-			event: testEvent{id: 9, seq: 3},
+			name: "second",
+			events: []Event{
+				testEvent{id: 9, seq: 3},
+			},
 			stateBefore: fetchHandlerState{
 				firstSequence: 2,
 				lastSequence:  2,
@@ -338,8 +354,10 @@ func TestRunFetchHandler_Event(t *testing.T) {
 			},
 		},
 		{
-			name:  "wrap",
-			event: testEvent{id: 18, seq: 6},
+			name: "wrap",
+			events: []Event{
+				testEvent{id: 18, seq: 6},
+			},
 			stateBefore: fetchHandlerState{
 				firstSequence: 2,
 				lastSequence:  5,
@@ -362,8 +380,10 @@ func TestRunFetchHandler_Event(t *testing.T) {
 			},
 		},
 		{
-			name:  "near-wrap",
-			event: testEvent{id: 13, seq: 5},
+			name: "near-wrap",
+			events: []Event{
+				testEvent{id: 13, seq: 5},
+			},
 			stateBefore: fetchHandlerState{
 				firstSequence: 2,
 				lastSequence:  4,
@@ -385,14 +405,118 @@ func TestRunFetchHandler_Event(t *testing.T) {
 				},
 			},
 		},
+		{
+			name: "multiple-events",
+			events: []Event{
+				testEvent{id: 10, seq: 2},
+				testEvent{id: 13, seq: 3},
+			},
+			stateBefore: fetchHandlerState{
+				data: make([]Event, 4),
+			},
+			stateAfter: fetchHandlerState{
+				firstSequence: 2,
+				lastSequence:  3,
+				data: []Event{
+					nil,
+					nil,
+					testEvent{id: 10, seq: 2},
+					testEvent{id: 13, seq: 3},
+				},
+			},
+		},
+		{
+			name: "multiple-events-wrap",
+			events: []Event{
+				testEvent{id: 12, seq: 2},
+				testEvent{id: 13, seq: 3},
+				testEvent{id: 14, seq: 4},
+				testEvent{id: 15, seq: 5},
+				testEvent{id: 16, seq: 6},
+			},
+			stateBefore: fetchHandlerState{
+				data: make([]Event, 4),
+			},
+			stateAfter: fetchHandlerState{
+				firstSequence: 3,
+				lastSequence:  6,
+				data: []Event{
+					testEvent{id: 14, seq: 4},
+					testEvent{id: 15, seq: 5},
+					testEvent{id: 16, seq: 6},
+					testEvent{id: 13, seq: 3},
+				},
+			},
+		},
+		{
+			name: "multiple-events-with-wait-list",
+			events: []Event{
+				testEvent{id: 17, seq: 7},
+				testEvent{id: 18, seq: 8},
+			},
+			stateBefore: fetchHandlerState{
+				firstSequence: 3,
+				lastSequence:  6,
+				data: []Event{
+					testEvent{id: 14, seq: 4},
+					testEvent{id: 15, seq: 5},
+					testEvent{id: 16, seq: 6},
+					testEvent{id: 13, seq: 3},
+				},
+				waitList: []fetchRequest{
+					{
+						fromSequence: 7,
+						limit:        2,
+					},
+					{
+						fromSequence: 7,
+						limit:        1,
+					},
+				},
+			},
+			stateAfter: fetchHandlerState{
+				firstSequence: 5,
+				lastSequence:  8,
+				data: []Event{
+					testEvent{id: 18, seq: 8},
+					testEvent{id: 15, seq: 5},
+					testEvent{id: 16, seq: 6},
+					testEvent{id: 17, seq: 7},
+				},
+				waitList: []fetchRequest{},
+			},
+			responses: []fetchResponse{
+				{
+					existed: true,
+					data: []Event{
+						testEvent{id: 17, seq: 7},
+						testEvent{id: 18, seq: 8},
+					},
+				},
+				{
+					existed: true,
+					data: []Event{
+						testEvent{id: 17, seq: 7},
+					},
+				},
+			},
+		},
 	}
 
 	for _, e := range table {
 		t.Run(e.name, func(t *testing.T) {
 			ctx := context.Background()
-			eventChan := make(chan Event, 1)
+			eventChan := make(chan Event, len(e.events))
 
-			eventChan <- e.event
+			for _, event := range e.events {
+				eventChan <- event
+			}
+
+			responseCount := len(e.stateBefore.waitList)
+			responseChan := make(chan fetchResponse, responseCount)
+			for i := range e.stateBefore.waitList {
+				e.stateBefore.waitList[i].responseChan = responseChan
+			}
 
 			config := &fetchHandlerConfig{
 				getSequence: getSequence,
@@ -404,9 +528,239 @@ func TestRunFetchHandler_Event(t *testing.T) {
 				eventChan: eventChan,
 			}, &state, config)
 
-			assert.Equal(t, state, e.stateAfter)
+			var responses []fetchResponse
+			for i := 0; i < responseCount; i++ {
+				resp := <-responseChan
+				responses = append(responses, resp)
+			}
+
+			assert.Equal(t, e.stateAfter, state)
+			assert.Equal(t, 0, len(eventChan))
+			assert.Equal(t, e.responses, responses)
 		})
 	}
+}
+
+func TestRunFetchHandler_Request(t *testing.T) {
+	table := []struct {
+		name        string
+		request     fetchRequest
+		stateBefore fetchHandlerState
+		stateAfter  *fetchHandlerState
+		expected    fetchResponse
+		notWaitResp bool
+	}{
+		{
+			name: "state-empty-request-from-1",
+			request: fetchRequest{
+				fromSequence: 1,
+				data:         nil,
+				limit:        3,
+			},
+			stateBefore: fetchHandlerState{
+				firstSequence: 0,
+				lastSequence:  0,
+			},
+			stateAfter: &fetchHandlerState{
+				waitList: []fetchRequest{
+					{
+						fromSequence: 1,
+						data:         nil,
+						limit:        3,
+					},
+				},
+			},
+			notWaitResp: true,
+		},
+		{
+			name: "existed-single-request-from-not-exist",
+			request: fetchRequest{
+				fromSequence: 1,
+				data:         nil,
+				limit:        3,
+			},
+			stateBefore: fetchHandlerState{
+				firstSequence: 2,
+				lastSequence:  2,
+				data: []Event{
+					nil,
+					nil,
+					testEvent{id: 10, seq: 2},
+					nil,
+				},
+			},
+			expected: fetchResponse{
+				existed: false,
+			},
+		},
+		{
+			name: "existed-single",
+			request: fetchRequest{
+				fromSequence: 1,
+				data:         nil,
+				limit:        3,
+			},
+			stateBefore: fetchHandlerState{
+				firstSequence: 1,
+				lastSequence:  1,
+				data: []Event{
+					nil,
+					testEvent{id: 10, seq: 1},
+					nil,
+					nil,
+				},
+			},
+			expected: fetchResponse{
+				existed: true,
+				data: []Event{
+					testEvent{id: 10, seq: 1},
+				},
+			},
+		},
+		{
+			name: "existed-multiple",
+			request: fetchRequest{
+				fromSequence: 1,
+				limit:        3,
+			},
+			stateBefore: fetchHandlerState{
+				firstSequence: 1,
+				lastSequence:  2,
+				data: []Event{
+					nil,
+					testEvent{id: 10, seq: 1},
+					testEvent{id: 9, seq: 2},
+					nil,
+				},
+			},
+			expected: fetchResponse{
+				existed: true,
+				data: []Event{
+					testEvent{id: 10, seq: 1},
+					testEvent{id: 9, seq: 2},
+				},
+			},
+		},
+		{
+			name: "reach-limit",
+			request: fetchRequest{
+				fromSequence: 1,
+				limit:        2,
+			},
+			stateBefore: fetchHandlerState{
+				firstSequence: 1,
+				lastSequence:  3,
+				data: []Event{
+					nil,
+					testEvent{id: 10, seq: 1},
+					testEvent{id: 9, seq: 2},
+					testEvent{id: 11, seq: 3},
+				},
+			},
+			expected: fetchResponse{
+				existed: true,
+				data: []Event{
+					testEvent{id: 10, seq: 1},
+					testEvent{id: 9, seq: 2},
+				},
+			},
+		},
+		{
+			name: "reach-limit-wrap-around",
+			request: fetchRequest{
+				fromSequence: 6,
+				limit:        3,
+			},
+			stateBefore: fetchHandlerState{
+				firstSequence: 6,
+				lastSequence:  9,
+				data: []Event{
+					testEvent{id: 12, seq: 8},
+					testEvent{id: 14, seq: 9},
+					testEvent{id: 9, seq: 6},
+					testEvent{id: 11, seq: 7},
+				},
+			},
+			expected: fetchResponse{
+				existed: true,
+				data: []Event{
+					testEvent{id: 9, seq: 6},
+					testEvent{id: 11, seq: 7},
+					testEvent{id: 12, seq: 8},
+				},
+			},
+		},
+	}
+
+	for _, e := range table {
+		t.Run(e.name, func(t *testing.T) {
+			ctx := context.Background()
+
+			responseChan := make(chan fetchResponse, 1)
+			e.request.responseChan = responseChan
+
+			if e.stateAfter != nil {
+				for i := range e.stateAfter.waitList {
+					e.stateAfter.waitList[i].responseChan = responseChan
+				}
+			}
+
+			requestChan := make(chan fetchRequest, 1)
+			requestChan <- e.request
+
+			state := e.stateBefore
+			runFetchHandler(ctx, fetchHandlerInput{
+				requestChan: requestChan,
+			}, &state, nil)
+
+			var response fetchResponse
+			if !e.notWaitResp {
+				response = <-responseChan
+			}
+
+			if e.stateAfter != nil {
+				assert.Equal(t, *e.stateAfter, state)
+			} else {
+				assert.Equal(t, e.stateBefore, state)
+			}
+
+			assert.Equal(t, e.expected, response)
+		})
+	}
+}
+
+func TestRunFetchHandler_Panic(t *testing.T) {
+	state := fetchHandlerState{
+		firstSequence: 1,
+		lastSequence:  1,
+		data: []Event{
+			nil,
+			testEvent{id: 12, seq: 1},
+			nil,
+			nil,
+		},
+	}
+
+	requestChan := make(chan fetchRequest, 1)
+	requestChan <- fetchRequest{
+		fromSequence: 3,
+		limit:        3,
+		responseChan: make(chan fetchResponse, 1),
+	}
+
+	defer func() {
+		if msg, ok := recover().(string); ok {
+			assert.Equal(t, "fromSequence MUST <= lastSequence + 1", msg)
+		} else {
+			assert.Fail(t, "must panic")
+		}
+	}()
+
+	ctx := context.Background()
+	runFetchHandler(ctx, fetchHandlerInput{
+		requestChan: requestChan,
+	}, &state, nil)
+
 }
 
 func TestNewFetchHandlerState(t *testing.T) {
